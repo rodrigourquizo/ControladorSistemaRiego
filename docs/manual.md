@@ -25,4 +25,4 @@ Dependencias
 Para ver la lista completa, consulta el archivo requirements.txt.
 
 Pruebas
-python3 -m unittest discover tests/
+python -m unittest discover tests/
