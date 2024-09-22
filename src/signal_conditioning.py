@@ -1,46 +1,82 @@
+# signal_conditioning.py
+
+import logging
+import numpy as np
 from scipy import signal
 
+# Configuración del logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
+
 class SignalConditioning:
-    def __init__(self):
-        """
-        Inicializa el módulo de acondicionamiento de señal, encargado de procesar las señales 
-        antes de ser enviadas al ADC (entrada) o desde el DAC (salida).
-        """
-        print("Acondicionamiento de Señal inicializado")
+    """
+    Clase para el acondicionamiento de señales de entrada y salida.
+    Proporciona métodos para filtrar ruido, eliminar interferencias y ajustar niveles
+    antes de la conversión ADC/DAC o interacción con sensores y actuadores.
+    """
 
-    def acondicionar_entrada(self, valor):
+    def __init__(self, fs=1.0):
         """
-        Simula el acondicionamiento de la señal de entrada proveniente de un sensor antes 
-        de enviarla al ADC. Se usa un filtro para reducir el ruido en la señal.
-        :param valor: Valor de la señal proveniente del sensor.
-        :return: Valor filtrado y acondicionado.
-        """
-        # Aplicamos un filtro para eliminar ruido de la señal
-        valor_filtrado = self.filtrar_ruido(valor)
-        print(f"Valor de entrada acondicionado: {valor_filtrado:.2f}")
-        return valor_filtrado
+        Inicializa el módulo de acondicionamiento de señal con la frecuencia de muestreo (fs).
+        También configura los filtros Butterworth (pasa bajo y pasa alto).
 
-    def acondicionar_salida(self, valor):
+        :param fs: Frecuencia de muestreo en Hz (por defecto 1 Hz para señales lentas).
         """
-        Acondiciona la señal de salida antes de enviarla a los actuadores (ej. DAC).
-        Este método puede ser útil para ajustar las señales que activan los actuadores.
-        :param valor: Valor de salida que será enviado al actuador.
-        :return: Valor procesado (actualmente no hay procesamiento adicional).
-        """
-        # Por ahora no se realiza acondicionamiento de salida, pero este método está preparado
-        # para futuras expansiones donde se requiera modificar la señal antes de enviarla al DAC.
-        print(f"Valor de salida sin acondicionar: {valor:.2f}")
-        return valor
+        self.fs = fs  # Frecuencia de muestreo
+        self.nyq = 0.5 * fs  # Frecuencia de Nyquist
 
-    def filtrar_ruido(self, valor):
+        # Almacenar históricos de valores para cada tipo de señal
+        self.historicos = {
+            'humedad': [],
+            'ph': [],
+            'ce': [],
+            'nivel': []
+        }
+
+        logging.info("Módulo de Acondicionamiento de Señal inicializado.")
+
+    def acondicionar_humedad(self, valor):
         """
-        Aplica un filtro paso bajo para reducir el ruido en la señal.
-        :param valor: Valor de la señal a filtrar.
-        :return: Valor filtrado, suavizado para reducir el ruido.
+        Acondiciona la señal de humedad.
         """
-        # Se usa un filtro de Butterworth de orden 3, con una frecuencia de corte baja (0.05)
-        b, a = signal.butter(3, 0.05)  # Filtro paso bajo de orden 3
-        # Filtramos la señal utilizando el filtro diseñado
-        valor_filtrado = signal.filtfilt(b, a, [valor])[0]
-        print(f"Valor filtrado (ruido reducido): {valor_filtrado:.2f}")
+        return self._filtrar_valor(valor, 'humedad')
+
+    def acondicionar_ph(self, valor):
+        """
+        Acondiciona la señal de pH.
+        """
+        return self._filtrar_valor(valor, 'ph')
+
+    def acondicionar_ce(self, valor):
+        """
+        Acondiciona la señal de conductividad eléctrica.
+        """
+        return self._filtrar_valor(valor, 'ce')
+
+    def acondicionar_nivel(self, valor):
+        """
+        Acondiciona la señal de nivel de agua.
+        """
+        return self._filtrar_valor(valor, 'nivel')
+
+    def _filtrar_valor(self, valor, tipo):
+        """
+        Aplica un filtro promedio móvil sencillo al valor para reducir el ruido.
+
+        :param valor: Valor actual del sensor.
+        :param tipo: Tipo de sensor ('humedad', 'ph', 'ce', 'nivel').
+        :return: Valor filtrado.
+        """
+        # Obtener el historial correspondiente
+        historial = self.historicos.get(tipo, [])
+        # Añadir el valor actual al historial
+        historial.append(valor)
+        # Mantener solo los últimos 5 valores
+        if len(historial) > 5:
+            historial.pop(0)
+        # Actualizar el historial
+        self.historicos[tipo] = historial
+        # Calcular el promedio de los valores en el historial
+        valor_filtrado = np.mean(historial)
+        logging.debug(f"Valor filtrado para {tipo}: {valor_filtrado}")
         return valor_filtrado
