@@ -3,7 +3,7 @@
 import time
 import logging
 import sys
-
+from unittest.mock import MagicMock
 # Simular RPi.GPIO solo si no estamos en un Raspberry Pi
 if sys.platform == "win32":
     from unittest.mock import MagicMock

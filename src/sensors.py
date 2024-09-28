@@ -3,7 +3,7 @@ import logging
 import threading
 import random
 import sys
-
+from unittest.mock import MagicMock
 # Importar librerías necesarias para interactuar con el hardware
 try:
     import Adafruit_ADS1x15  # Librería para el ADC ADS1115
