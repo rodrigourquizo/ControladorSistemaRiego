@@ -1,17 +1,20 @@
+# sensors.py
+
 import time
 import logging
 import threading
 import random
 import sys
-from unittest.mock import MagicMock
-# Importar librerías necesarias para interactuar con el hardware
+# Importar librerías necesarias para Modbus RTU sobre RS485
 try:
-    import Adafruit_ADS1x15  # Librería para el ADC ADS1115
+    from pymodbus.client import ModbusSerialClient
+    from pymodbus.constants import Endian
+    from pymodbus.payload import BinaryPayloadDecoder
 except ImportError:
-    logging.warning("Librería Adafruit_ADS1x15 no disponible. Ejecutando en modo simulado.")
-    Adafruit_ADS1x15 = None
+    logging.warning("Librería pymodbus no disponible. Ejecutando en modo simulado.")
+    ModbusSerialClient = None
 
-# Simular RPi.GPIO solo si no estamos en un Raspberry Pi
+# Simular RPi.GPIO solo si no estamos en una Raspberry Pi
 if sys.platform == "win32":
     from unittest.mock import MagicMock
     GPIO = MagicMock()
@@ -26,57 +29,105 @@ else:
 # Configuración del logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
+# Configurar GPIO
+if GPIO is not None:
+    GPIO.setmode(GPIO.BCM)
+    # Pines de alimentación para sensores y conversor
+    GPIO.setup(4, GPIO.OUT)   # VCC
+    GPIO.setup(6, GPIO.OUT)   # GND
+
+    # Pines para RS485 (MAX485 o similar)
+    GPIO.setup(14, GPIO.OUT)  # DE (Driver Enable)
+    GPIO.setup(15, GPIO.IN)   # RE (Receiver Enable)
+    GPIO.setup(27, GPIO.OUT)  # Control de DE/RE
+
+    # Pines para sensor de flujo
+    GPIO.setup(17, GPIO.IN, pull_up_down=GPIO.PUD_UP)  # GPIO 17 - Salida de pulsos del sensor de flujo
+
+    # Pines para sensor US-100
+    GPIO.setup(18, GPIO.OUT)  # TRIG/TX del sensor US-100
+    GPIO.setup(24, GPIO.IN)   # ECHO/RX del sensor US-100
+
+    # Configurar pines de alimentación
+    GPIO.output(4, GPIO.HIGH)  # Activar VCC
+    GPIO.output(6, GPIO.LOW)   # Conectar GND
+
+    # Configurar control DE/RE en recepción inicialmente
+    GPIO.setup(27, GPIO.OUT)
+    GPIO.output(27, GPIO.LOW)  # RE y DE en bajo para recepción
 
 class SensorBase:
     """
-    Clase base para los sensores. Proporciona métodos comunes como lectura del ADC,
-    calibración y detección de fallos.
+    Clase base para los sensores Modbus.
     """
-    def __init__(self, channel, adc_gain=1, calibration_params=None):
-        """
-        Inicializa el sensor con el canal ADC correspondiente y parámetros de calibración.
+    modbus_client = None
+    modbus_lock = threading.Lock()
 
-        :param channel: Canal del ADC al que está conectado el sensor (0-3).
-        :param adc_gain: Ganancia del ADC (por defecto 1).
-        :param calibration_params: Parámetros de calibración específicos del sensor.
+    @classmethod
+    def initialize_modbus_client(cls):
+        if cls.modbus_client is None:
+            if not GPIO:
+                logging.error("GPIO no está disponible. No se puede inicializar Modbus.")
+                return
+            # Configurar pines para RS485
+            cls.DE_RE_PIN = 27  # GPIO 27 para DE y RE del MAX485
+            serial_port = '/dev/ttyS0'  # Puerto serial para Raspberry Pi (UART)
+            cls.modbus_client = ModbusSerialClient(
+                method='rtu',
+                port=serial_port,
+                baudrate=9600,
+                bytesize=8,
+                parity='N',
+                stopbits=1,
+                timeout=1,
+            )
+            if cls.modbus_client.connect():
+                logging.info("Cliente Modbus conectado exitosamente.")
+            else:
+                logging.error("Fallo al conectar el cliente Modbus.")
+
+    def __init__(self, address, calibration_params=None):
         """
-        self.channel = channel
-        self.adc_gain = adc_gain
+        Inicializa el sensor con la dirección Modbus y parámetros de calibración.
+        """
+        self.address = address  # ID del esclavo Modbus
         self.calibration_params = calibration_params or {}
         self.last_reading = None
-        self.adc = None
         self.simulation_mode = sys.platform == "win32"
 
-        if Adafruit_ADS1x15 is not None and not self.simulation_mode:
-            try:
-                self.adc = Adafruit_ADS1x15.ADS1115()
-                logging.info(f"Sensor en canal {self.channel} inicializado con hardware real.")
-            except Exception as e:
-                logging.warning(f"No se pudo inicializar el ADC: {e}. Ejecutando en modo simulado.")
-                self.adc = None
+        if not self.simulation_mode:
+            self.initialize_modbus_client()
         else:
-            logging.info(f"Sensor en canal {self.channel} inicializado en modo simulado.")
+            logging.info(f"Sensor en dirección {self.address} inicializado en modo simulado.")
 
-    def leer_adc(self):
+    def leer_modbus(self, register_address, register_count):
         """
-        Lee el valor bruto del ADC para el canal especificado.
-        :return: Valor entero leído del ADC.
+        Lee los registros Modbus del sensor.
         """
-        if self.adc:
+        if not self.simulation_mode and self.modbus_client:
             try:
-                value = self.adc.read_adc(self.channel, gain=self.adc_gain)
-                logging.debug(f"Valor bruto del ADC en canal {self.channel}: {value}")
-                return value
+                with self.modbus_lock:
+                    # Controlar DE/RE para transmisión
+                    GPIO.output(self.DE_RE_PIN, GPIO.HIGH)  # Modo transmisión
+                    time.sleep(0.01)  # Pequeña espera para cambio de modo
+                    result = self.modbus_client.read_holding_registers(register_address, register_count, unit=self.address)
+                    GPIO.output(self.DE_RE_PIN, GPIO.LOW)  # Modo recepción
+                if not result.isError():
+                    logging.debug(f"Lectura Modbus desde dirección {self.address}: {result.registers}")
+                    return result.registers
+                else:
+                    logging.error(f"Error al leer Modbus en dirección {self.address}: {result}")
+                    raise Exception("Error al leer Modbus")
             except Exception as e:
-                logging.error(f"Error al leer el ADC en canal {self.channel}: {e}")
+                logging.error(f"Error al leer Modbus en dirección {self.address}: {e}")
                 raise
         else:
-            # Modo simulado, implementado en cada sensor específico
-            raise NotImplementedError("La lectura simulada del ADC debe ser implementada en cada sensor.")
+            # Modo simulado
+            return [random.randint(0, 1000) for _ in range(register_count)]
 
     def calibrar(self, raw_value):
         """
-        Aplica la calibración al valor bruto leído del ADC.
+        Aplica la calibración al valor bruto leído vía Modbus.
         Este método debe ser implementado por cada sensor específico.
         """
         raise NotImplementedError("El método calibrar() debe ser implementado por subclases.")
@@ -86,7 +137,7 @@ class SensorBase:
         Lee el valor del sensor, aplica calibración y detecta posibles fallos.
         :return: Valor calibrado del sensor.
         """
-        raw_value = self.leer_adc()
+        raw_value = self.leer_modbus(self.register_address, self.register_count)
         calibrated_value = self.calibrar(raw_value)
         self.last_reading = calibrated_value
         return calibrated_value
@@ -97,282 +148,189 @@ class SensorBase:
         """
         pass
 
-    def iniciar_monitoreo(self):
-        """
-        Inicia un hilo separado para monitorear el sensor en busca de fallos.
-        """
-        threading.Thread(target=self._monitorear_sensor).start()
-
-    def _monitorear_sensor(self):
-        """
-        Hilo que monitorea continuamente el sensor para detectar fallos.
-        """
-        while True:
-            try:
-                self.detectar_fallo()
-                time.sleep(60)  # Verificar cada minuto
-            except Exception as e:
-                logging.error(f"Error en monitoreo del sensor en canal {self.channel}: {e}")
-                break
-
-
-class HumiditySensor(SensorBase):
+class SoilSensor(SensorBase):
     """
-    Sensor de humedad del suelo.
+    Sensor 4 en 1 RS485 que mide temperatura, humedad, CE y pH.
     """
-    def __init__(self, channel, adc_gain=1, calibration_params=None):
-        super().__init__(channel, adc_gain, calibration_params)
-        logging.info("Sensor de Humedad inicializado.")
+    def __init__(self, address, calibration_params=None):
+        super().__init__(address, calibration_params)
+        self.register_address = 0x0000  # Dirección inicial del registro
+        self.register_count = 4         # Cantidad de registros a leer (humedad, temperatura, CE, pH)
+        logging.info("Sensor de Suelo 4 en 1 inicializado.")
 
-    def leer_adc(self):
-        if self.adc:
-            # Lectura del hardware
-            try:
-                value = self.adc.read_adc(self.channel, gain=self.adc_gain)
-                logging.debug(f"Valor bruto del ADC en canal {self.channel}: {value}")
-                return value
-            except Exception as e:
-                logging.error(f"Error al leer el ADC en canal {self.channel}: {e}")
-                raise
-        else:
-            # Modo simulado
-            try:
-                min_adc = int(float(self.calibration_params.get('min_adc', 0)))
-                max_adc = int(float(self.calibration_params.get('max_adc', 32767)))
-                logging.debug(f"min_adc: {min_adc}, max_adc: {max_adc}")
-            except (TypeError, ValueError) as e:
-                logging.error(f"Error en 'min_adc' o 'max_adc' en HumiditySensor: {e}")
-                min_adc = 0
-                max_adc = 32767
-            value = random.randint(min_adc, max_adc)
-            logging.debug(f"Valor simulado del ADC de humedad en canal {self.channel}: {value}")
-            return value
-
-    def calibrar(self, raw_value):
+    def leer(self):
         """
-        Convierte el valor bruto del ADC en porcentaje de humedad.
+        Lee todos los valores del sensor y los calibra.
+        :return: Diccionario con humedad, temperatura, CE y pH.
         """
-        try:
-            min_adc = float(self.calibration_params.get('min_adc', 0))
-            max_adc = float(self.calibration_params.get('max_adc', 32767))
-            min_humidity = float(self.calibration_params.get('min_humidity', 0.0))
-            max_humidity = float(self.calibration_params.get('max_humidity', 100.0))
-            logging.debug(f"Calibración de humedad: min_adc={min_adc}, max_adc={max_adc}, min_humidity={min_humidity}, max_humidity={max_humidity}")
-        except (TypeError, ValueError) as e:
-            logging.error(f"Error en parámetros de calibración en HumiditySensor: {e}")
-            min_adc, max_adc = 0, 32767
-            min_humidity, max_humidity = 0.0, 100.0
+        if not self.simulation_mode:
+            raw_values = self.leer_modbus(self.register_address, self.register_count)
+            if raw_values:
+                humidity_raw = raw_values[0]
+                temperature_raw = raw_values[1]
+                ce_raw = raw_values[2]
+                ph_raw = raw_values[3]
 
-        if max_adc != min_adc:
-            humidity = (raw_value - min_adc) * (max_humidity - min_humidity) / (max_adc - min_adc) + min_humidity
-        else:
-            logging.error("max_adc y min_adc son iguales, división por cero en calibración.")
-            humidity = min_humidity
-        humidity = max(min(humidity, max_humidity), min_humidity)
-        logging.debug(f"Valor de humedad calibrado: {humidity:.2f}%")
-        return humidity
+                humidity = humidity_raw / 10.0  # Humedad en %
+                temperature = self._calibrar_temperatura(temperature_raw)  # Temperatura en °C
+                ce = ce_raw  # CE en μS/cm
+                ph = ph_raw / 10.0  # pH
 
-    def detectar_fallo(self):
-        """
-        Detecta si el sensor de humedad está fallando.
-        """
-        if self.last_reading is None:
-            logging.warning("No se ha podido obtener lectura del sensor de humedad.")
-            return True
-        return False
+                self.last_reading = {
+                    'humidity': humidity,
+                    'temperature': temperature,
+                    'ce': ce,
+                    'ph': ph
+                }
 
-
-class PhSensor(SensorBase):
-    """
-    Sensor de pH.
-    """
-    def __init__(self, channel, adc_gain=1, calibration_params=None):
-        super().__init__(channel, adc_gain, calibration_params)
-        logging.info("Sensor de pH inicializado.")
-
-    def leer_adc(self):
-        if self.adc:
-            # Lectura del hardware
-            try:
-                value = self.adc.read_adc(self.channel, gain=self.adc_gain)
-                logging.debug(f"Valor bruto del ADC en canal {self.channel}: {value}")
-                return value
-            except Exception as e:
-                logging.error(f"Error al leer el ADC en canal {self.channel}: {e}")
-                raise
-        else:
-            # Modo simulado
-            try:
-                min_adc = int(float(self.calibration_params.get('min_adc', 0)))
-                max_adc = int(float(self.calibration_params.get('max_adc', 32767)))
-                logging.debug(f"min_adc: {min_adc}, max_adc: {max_adc}")
-            except (TypeError, ValueError) as e:
-                logging.error(f"Error en 'min_adc' o 'max_adc' en PhSensor: {e}")
-                min_adc = 0
-                max_adc = 32767
-            value = random.randint(min_adc, max_adc)
-            logging.debug(f"Valor simulado del ADC de pH en canal {self.channel}: {value}")
-            return value
-
-    def calibrar(self, raw_value):
-        """
-        Convierte el valor bruto del ADC en valor de pH.
-        """
-        try:
-            min_adc = float(self.calibration_params.get('min_adc', 0))
-            max_adc = float(self.calibration_params.get('max_adc', 32767))
-            min_ph = float(self.calibration_params.get('min_ph', 0.0))
-            max_ph = float(self.calibration_params.get('max_ph', 14.0))
-            logging.debug(f"Calibración lineal de pH: min_adc={min_adc}, max_adc={max_adc}, min_ph={min_ph}, max_ph={max_ph}")
-            if max_adc != min_adc:
-                ph = (raw_value - min_adc) * (max_ph - min_ph) / (max_adc - min_adc) + min_ph
+                logging.debug(f"Valores calibrados: {self.last_reading}")
+                return self.last_reading
             else:
-                logging.error("max_adc y min_adc son iguales, división por cero en calibración.")
-                ph = min_ph
-        except (TypeError, ValueError) as e:
-            logging.error(f"Error en parámetros de calibración en PhSensor: {e}")
-            ph = 7.0  # Valor por defecto
-        ph = max(min(ph, 14.0), 0.0)
-        logging.debug(f"Valor de pH calibrado: {ph:.2f}")
-        return ph
-
-    def detectar_fallo(self):
-        """
-        Detecta si el sensor de pH está fallando.
-        """
-        if self.last_reading is None:
-            logging.warning("No se ha podido obtener lectura del sensor de pH.")
-            return True
-        return False
-
-
-class CESensor(SensorBase):
-    """
-    Sensor de Conductividad Eléctrica (CE).
-    """
-    def __init__(self, channel, adc_gain=1, calibration_params=None):
-        super().__init__(channel, adc_gain, calibration_params)
-        logging.info("Sensor de Conductividad Eléctrica inicializado.")
-
-    def leer_adc(self):
-        if self.adc:
-            # Lectura del hardware
-            try:
-                value = self.adc.read_adc(self.channel, gain=self.adc_gain)
-                logging.debug(f"Valor bruto del ADC en canal {self.channel}: {value}")
-                return value
-            except Exception as e:
-                logging.error(f"Error al leer el ADC en canal {self.channel}: {e}")
-                raise
+                logging.error("No se pudieron obtener los valores del sensor de suelo.")
+                return None
         else:
             # Modo simulado
-            try:
-                min_adc = int(float(self.calibration_params.get('min_adc', 0)))
-                max_adc = int(float(self.calibration_params.get('max_adc', 32767)))
-                logging.debug(f"min_adc: {min_adc}, max_adc: {max_adc}")
-            except (TypeError, ValueError) as e:
-                logging.error(f"Error en 'min_adc' o 'max_adc' en CESensor: {e}")
-                min_adc = 0
-                max_adc = 32767
-            value = random.randint(min_adc, max_adc)
-            logging.debug(f"Valor simulado del ADC de CE en canal {self.channel}: {value}")
-            return value
+            self.last_reading = {
+                'humidity': random.uniform(0, 100),
+                'temperature': random.uniform(-20, 80),
+                'ce': random.uniform(0, 20000),
+                'ph': random.uniform(3, 9)
+            }
+            logging.debug(f"Valores simulados: {self.last_reading}")
+            return self.last_reading
 
-    def calibrar(self, raw_value):
+    def _calibrar_temperatura(self, raw_value):
         """
-        Convierte el valor bruto del ADC en valor de CE (mS/cm).
+        Calibra el valor de temperatura, considerando números negativos.
         """
-        try:
-            min_adc = float(self.calibration_params.get('min_adc', 0))
-            max_adc = float(self.calibration_params.get('max_adc', 32767))
-            min_ce = float(self.calibration_params.get('min_ce', 0.0))
-            max_ce = float(self.calibration_params.get('max_ce', 5.0))
-            logging.debug(f"Calibración de CE: min_adc={min_adc}, max_adc={max_adc}, min_ce={min_ce}, max_ce={max_ce}")
-        except (TypeError, ValueError) as e:
-            logging.error(f"Error en parámetros de calibración en CESensor: {e}")
-            min_adc, max_adc = 0, 32767
-            min_ce, max_ce = 0.0, 5.0
-
-        if max_adc != min_adc:
-            ce = (raw_value - min_adc) * (max_ce - min_ce) / (max_adc - min_adc) + min_ce
+        if raw_value >= 0x8000:
+            # Número negativo en complemento a dos
+            temperature = -(0x10000 - raw_value) / 10.0
         else:
-            logging.error("max_adc y min_adc son iguales, división por cero en calibración.")
-            ce = min_ce
-        ce = max(min(ce, max_ce), min_ce)
-        logging.debug(f"Valor de CE calibrado: {ce:.2f} mS/cm")
-        return ce
+            temperature = raw_value / 10.0
+        return temperature
 
-    def detectar_fallo(self):
-        """
-        Detecta si el sensor de CE está fallando.
-        """
-        if self.last_reading is None:
-            logging.warning("No se ha podido obtener lectura del sensor de CE.")
-            return True
-        return False
-
-
-class LevelSensor(SensorBase):
+class LevelSensor:
     """
-    Sensor de nivel de agua.
+    Sensor de nivel de agua US-100 en modo Trigger/Echo.
     """
-    def __init__(self, channel, adc_gain=1, calibration_params=None):
-        super().__init__(channel, adc_gain, calibration_params)
-        logging.info("Sensor de Nivel de Agua inicializado.")
+    def __init__(self, trig_pin, echo_pin, calibration_params=None):
+        self.trig_pin = trig_pin
+        self.echo_pin = echo_pin
+        self.calibration_params = calibration_params or {}
+        self.last_reading = None
+        self.simulation_mode = sys.platform == "win32"
 
-    def leer_adc(self):
-        if self.adc:
-            # Lectura del hardware
-            try:
-                value = self.adc.read_adc(self.channel, gain=self.adc_gain)
-                logging.debug(f"Valor bruto del ADC en canal {self.channel}: {value}")
-                return value
-            except Exception as e:
-                logging.error(f"Error al leer el ADC en canal {self.channel}: {e}")
-                raise
+        if not self.simulation_mode:
+            GPIO.setup(self.trig_pin, GPIO.OUT)
+            GPIO.setup(self.echo_pin, GPIO.IN)
+            logging.info("Sensor de Nivel de Agua inicializado.")
+        else:
+            logging.info("Sensor de Nivel de Agua inicializado en modo simulado.")
+
+    def leer(self):
+        """
+        Lee la distancia medida por el sensor ultrasonido y calcula el nivel de agua.
+        """
+        if not self.simulation_mode:
+            # Enviar un pulso de 10μs en el pin TRIG
+            GPIO.output(self.trig_pin, True)
+            time.sleep(0.00001)
+            GPIO.output(self.trig_pin, False)
+
+            # Medir el tiempo de respuesta del eco
+            timeout = time.time() + 1  # Timeout de 1 segundo
+
+            while GPIO.input(self.echo_pin) == 0:
+                inicio_pulso = time.time()
+                if inicio_pulso > timeout:
+                    logging.error("Timeout esperando inicio del pulso ECHO")
+                    return None
+
+            while GPIO.input(self.echo_pin) == 1:
+                fin_pulso = time.time()
+                if fin_pulso > timeout:
+                    logging.error("Timeout esperando fin del pulso ECHO")
+                    return None
+
+            duracion_pulso = fin_pulso - inicio_pulso
+
+            # Calcular la distancia (velocidad del sonido 34300 cm/s)
+            distancia = (duracion_pulso * 34300) / 2  # En cm
+
+            # Calcular nivel de agua en porcentaje
+            tank_height = self.calibration_params.get('tank_height', 200)  # Altura del tanque en cm
+            nivel = ((tank_height - distancia) / tank_height) * 100
+            nivel = max(0, min(100, nivel))  # Limitar entre 0% y 100%
+            self.last_reading = nivel
+            logging.debug(f"Nivel de agua medido: {nivel:.2f}%")
+            return nivel
         else:
             # Modo simulado
-            try:
-                min_adc = int(float(self.calibration_params.get('min_adc', 0)))
-                max_adc = int(float(self.calibration_params.get('max_adc', 32767)))
-                logging.debug(f"min_adc: {min_adc}, max_adc: {max_adc}")
-            except (TypeError, ValueError) as e:
-                logging.error(f"Error en 'min_adc' o 'max_adc' en LevelSensor: {e}")
-                min_adc = 0
-                max_adc = 32767
-            value = random.randint(min_adc, max_adc)
-            logging.debug(f"Valor simulado del ADC de nivel en canal {self.channel}: {value}")
-            return value
+            nivel = random.uniform(0, 100)
+            self.last_reading = nivel
+            logging.debug(f"Nivel de agua simulado: {nivel:.2f}%")
+            return nivel
 
-    def calibrar(self, raw_value):
-        """
-        Convierte el valor bruto del ADC en porcentaje de nivel de agua.
-        """
-        try:
-            min_adc = float(self.calibration_params.get('min_adc', 0))
-            max_adc = float(self.calibration_params.get('max_adc', 32767))
-            min_level = float(self.calibration_params.get('min_level', 0.0))
-            max_level = float(self.calibration_params.get('max_level', 100.0))
-            logging.debug(f"Calibración de Nivel: min_adc={min_adc}, max_adc={max_adc}, min_level={min_level}, max_level={max_level}")
-        except (TypeError, ValueError) as e:
-            logging.error(f"Error en parámetros de calibración en LevelSensor: {e}")
-            min_adc, max_adc = 0, 32767
-            min_level, max_level = 0.0, 100.0
+class FlowSensor:
+    """
+    Sensor de flujo de agua FS300A
+    """
+    def __init__(self, gpio_pin, calibration_params=None):
+        self.gpio_pin = gpio_pin
+        self.calibration_params = calibration_params or {}
+        self.last_reading = None
+        self.simulation_mode = sys.platform == "win32"
+        self.flow_frequency = 0
+        self.conversion_factor = self.calibration_params.get('factor', 5.5)
 
-        if max_adc != min_adc:
-            level = (raw_value - min_adc) * (max_level - min_level) / (max_adc - min_adc) + min_level
+        if not self.simulation_mode:
+            GPIO.setup(self.gpio_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.add_event_detect(self.gpio_pin, GPIO.RISING, callback=self._count_pulse)
+            logging.info("Sensor de flujo inicializado.")
         else:
-            logging.error("max_adc y min_adc son iguales, división por cero en calibración.")
-            level = min_level
-        level = max(min(level, max_level), min_level)
-        logging.debug(f"Valor de nivel calibrado: {level:.2f}%")
-        return level
+            logging.info("Sensor de flujo inicializado en modo simulado.")
 
-    def detectar_fallo(self):
+    def _count_pulse(self, channel):
+        self.flow_frequency += 1
+
+    def leer(self):
         """
-        Detecta si el sensor de nivel está fallando.
+        Lee el caudal actual en litros por minuto.
+        """
+        if not self.simulation_mode:
+            # Medir el número de pulsos durante 1 segundo
+            self.flow_frequency = 0
+            time.sleep(1)
+            frequency = self.flow_frequency  # Pulsos por segundo (Hz)
+            # Calcular el caudal en L/min
+            flow_rate = frequency / self.conversion_factor
+            self.last_reading = flow_rate
+            logging.debug(f"Caudal medido: {flow_rate:.3f} L/min")
+            return flow_rate
+        else:
+            # Modo simulado
+            flow_rate = random.uniform(0, 60)  # Rango del sensor 1-60 L/min
+            self.last_reading = flow_rate
+            logging.debug(f"Caudal simulado: {flow_rate:.3f} L/min")
+            return flow_rate
+
+    def detectar_fallo(self, expected_flow):
+        """
+        Detecta si hay fuga o bloqueo en las tuberías.
+        :param expected_flow: Caudal esperado en L/min
+        :return: True si hay fallo, False si todo está bien
         """
         if self.last_reading is None:
-            logging.warning("No se ha podido obtener lectura del sensor de nivel de agua.")
+            logging.warning("No se ha podido obtener lectura del sensor de flujo.")
             return True
+        if expected_flow is not None:
+            # Definir tolerancia para detectar anomalías
+            tolerance = self.calibration_params.get('tolerance', 0.2)  # 20% de tolerancia
+            if self.last_reading < expected_flow * (1 - tolerance):
+                logging.error("Posible bloqueo en las tuberías detectado.")
+                return True
+            elif self.last_reading > expected_flow * (1 + tolerance):
+                logging.error("Posible fuga en las tuberías detectada.")
+                return True
         return False

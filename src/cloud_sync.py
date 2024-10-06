@@ -26,7 +26,7 @@ class CloudSync:
     Incluye métodos para enviar datos, descargar modelos y verificar conexión a Internet.
     """
 
-    def __init__(self, credentials_path='config/credentials.json', bucket_name='your-gcp-bucket'):
+    def __init__(self, credentials_path='config/credentials.json', bucket_name='sistema-riego-datos-admin'):
         """
         Inicializa el módulo de sincronización con la nube.
         Configura las credenciales de Google Cloud Platform y establece conexión con el bucket de GCP.
@@ -154,42 +154,13 @@ class CloudSync:
             return
 
         try:
-            # Enviar una solicitud POST a una función en la nube (simulado aquí)
-            response = requests.post('https://your-cloud-function-url', json={'action': 'train_model'})
+            # URL de tu función en la nube
+            function_url = 'https://us-central1-sistemariegointeligente.cloudfunctions.net/train_model'
+            # Enviar una solicitud POST para activar el entrenamiento
+            response = requests.post(function_url)
             if response.status_code == 200:
                 logging.info("Entrenamiento del modelo en la nube iniciado correctamente.")
             else:
                 logging.error(f"Error al iniciar el entrenamiento en la nube: {response.text}")
         except Exception as e:
             logging.error(f"Error al enviar solicitud de entrenamiento a la nube: {e}")
-
-    def subir_datos_meteorologicos(self, datos_meteorologicos):
-        """
-        Envía datos meteorológicos a la nube para su uso en el entrenamiento del modelo.
-        Los datos se suben en formato JSON a un bucket de GCP.
-
-        :param datos_meteorologicos: Diccionario con los datos meteorológicos (temperatura, humedad, etc.).
-        """
-        if not self.verificar_conexion():
-            logging.warning("No hay conexión a Internet. No se pueden enviar datos meteorológicos.")
-            return
-
-        if self.bucket is None:
-            logging.error("No se pudo conectar al bucket de GCP. Datos meteorológicos no enviados.")
-            return
-
-        try:
-            # Generar nombre de archivo único usando timestamp
-            timestamp = int(time.time())
-            filename = f"weather_data_{timestamp}.json"
-
-            # Crear un blob en el bucket de GCP
-            blob = self.bucket.blob(f"weather_data/{filename}")
-            # Subir los datos meteorológicos
-            blob.upload_from_string(
-                data=json.dumps(datos_meteorologicos),
-                content_type='application/json'
-            )
-            logging.info(f"Datos meteorológicos enviados a la nube: {filename}")
-        except Exception as e:
-            logging.error(f"Error al enviar datos meteorológicos a la nube: {e}")

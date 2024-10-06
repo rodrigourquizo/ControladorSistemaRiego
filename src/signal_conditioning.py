@@ -2,7 +2,6 @@
 
 import logging
 import numpy as np
-from scipy import signal
 
 # Configuración del logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -18,7 +17,6 @@ class SignalConditioning:
     def __init__(self, fs=1.0):
         """
         Inicializa el módulo de acondicionamiento de señal con la frecuencia de muestreo (fs).
-        También configura los filtros Butterworth (pasa bajo y pasa alto).
 
         :param fs: Frecuencia de muestreo en Hz (por defecto 1 Hz para señales lentas).
         """
@@ -30,7 +28,8 @@ class SignalConditioning:
             'humedad': [],
             'ph': [],
             'ce': [],
-            'nivel': []
+            'nivel': [],
+            'temperatura': []
         }
 
         logging.info("Módulo de Acondicionamiento de Señal inicializado.")
@@ -59,12 +58,18 @@ class SignalConditioning:
         """
         return self._filtrar_valor(valor, 'nivel')
 
+    def acondicionar_temperatura(self, valor):
+        """
+        Acondiciona la señal de temperatura.
+        """
+        return self._filtrar_valor(valor, 'temperatura')
+
     def _filtrar_valor(self, valor, tipo):
         """
         Aplica un filtro promedio móvil sencillo al valor para reducir el ruido.
 
         :param valor: Valor actual del sensor.
-        :param tipo: Tipo de sensor ('humedad', 'ph', 'ce', 'nivel').
+        :param tipo: Tipo de sensor ('humedad', 'ph', 'ce', 'nivel', 'temperatura').
         :return: Valor filtrado.
         """
         # Obtener el historial correspondiente
