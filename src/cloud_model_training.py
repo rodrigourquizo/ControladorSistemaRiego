@@ -10,7 +10,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.metrics import classification_report
 
-# Establecer el ID del proyecto de Google Cloud
+# ID del proyecto de Google Cloud
 os.environ["GOOGLE_CLOUD_PROJECT"] = "sistemariegointeligente"
 
 # Configuración del logging
@@ -24,21 +24,21 @@ def train_model(request):
     """
     # Inicializar el cliente de Cloud Storage
     client = storage.Client()
-    bucket_name = 'sistema-riego-datos-admin'  # Asegúrate de usar tu bucket
+    bucket_name = 'sistema-riego-datos-admin'
     bucket = client.get_bucket(bucket_name)
 
     try:
-        # Obtener la lista de blobs en la carpeta 'sensor_data/'
-        blobs = bucket.list_blobs(prefix='sensor_data/')
+        # Obtener la lista de blobs en la carpeta 'decision_data/'
+        blobs = bucket.list_blobs(prefix='decision_data/')
 
         data_frames = []
 
         for blob in blobs:
-            if blob.name.endswith('.json'):
+            if blob.name.endswith('.csv'):
                 # Descargar el contenido del blob
-                content = blob.download_as_string()
-                # Convertir el contenido JSON a DataFrame
-                df = pd.read_json(content, lines=False)
+                content = blob.download_as_string().decode('utf-8')
+                # Convertir el contenido CSV a DataFrame
+                df = pd.read_csv(pd.compat.StringIO(content))
                 data_frames.append(df)
 
         if not data_frames:
@@ -49,24 +49,29 @@ def train_model(request):
         data = pd.concat(data_frames, ignore_index=True)
 
         # Preprocesamiento de datos
-        # Asegúrate de que los datos contengan las columnas necesarias
-        required_columns = ['humidity', 'temperature', 'ph', 'ce', 'water_level', 'target']
+        required_columns = ['humidity', 'temperature', 'ph', 'ce', 'water_level', 'flow_rate',
+                            'activar_bomba', 'abrir_valvula_riego', 'inyectar_fertilizante', 'abrir_valvula_suministro']
+
         missing_columns = [col for col in required_columns if col not in data.columns]
         if missing_columns:
             logging.error(f"Faltan las siguientes columnas en los datos: {missing_columns}")
             return (f"Error: Faltan columnas en los datos: {missing_columns}", 500)
 
-        X = data[['humidity', 'temperature', 'ph', 'ce', 'water_level']]
-        y = data['target']  # La columna 'target' debe indicar la acción deseada (por ejemplo, regar o no regar)
+        # Definir las características (X) y la variable objetivo (y)
+        X = data[['humidity', 'temperature', 'ph', 'ce', 'water_level', 'flow_rate']]
+        # Crear una variable objetivo basada en las acciones tomadas
+        # Por ejemplo, si 'activar_bomba' y 'abrir_valvula_riego' son True, el sistema decidió regar
+        data['target'] = data.apply(lambda row: int(row['activar_bomba'] and row['abrir_valvula_riego']), axis=1)
+        y = data['target']
 
         # Dividir los datos en conjuntos de entrenamiento y prueba
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
 
         # Definir el grid de hiperparámetros a probar
         param_grid = {
-            'n_estimators': [50, 100],
-            'max_depth': [None, 10],
-            'min_samples_split': [2, 5]
+            'n_estimators': [50, 100, 150],
+            'max_depth': [None, 10, 20],
+            'min_samples_split': [2, 5, 10]
         }
 
         # Configurar la búsqueda de los mejores hiperparámetros
