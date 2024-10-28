@@ -246,7 +246,7 @@ class LevelSensor:
         self.calibration_params = calibration_params or {}
         self.last_reading = None
         self.simulation_mode = sys.platform == "win32"
-
+        self.simulated_water_level = 79.0  # Nivel inicial en porcentaje
         # Implementación de lock para seguridad de hilos
         self.lock = threading.Lock()
 
@@ -257,7 +257,7 @@ class LevelSensor:
         else:
             logging.info("Sensor de Nivel de Agua inicializado en modo simulado.")
 
-    def leer(self, num_samples=5):
+    def leer(self, bomba_activa=False, num_samples=5):
         """
         Lee la distancia medida por el sensor ultrasonido y calcula el nivel de agua.
         Toma múltiples muestras y calcula un promedio para reducir el ruido.
@@ -274,7 +274,7 @@ class LevelSensor:
                 if distances:
                     average_distance = sum(distances) / len(distances)
                     # Calcular nivel de agua en porcentaje
-                    tank_height = self.calibration_params.get('tank_height', 200)  # Altura del tanque en cm
+                    tank_height = self.calibration_params.get('tank_height', 80)  # Altura del tanque en cm
                     nivel = ((tank_height - average_distance) / tank_height) * 100
                     nivel = max(0, min(100, nivel))  # Limitar entre 0% y 100%
                     with self.lock:
@@ -294,10 +294,19 @@ class LevelSensor:
                 logging.exception("Error al leer el sensor de nivel de agua:")
                 return None
         else:
-            # Modo simulado con valores realistas
-            nivel = random.uniform(20, 80)
             with self.lock:
+                if bomba_activa:
+                    # Disminuir el nivel de agua simulando el consumo
+                    decrement = 0.5  # Decremento por lectura
+                    self.simulated_water_level = max(self.simulated_water_level - decrement, 0.0)
+                else:
+                    # Recuperación lenta del nivel (por ejemplo, por lluvia)
+                    increment = 0.1  # Incremento por lectura
+                    self.simulated_water_level = min(self.simulated_water_level + increment, 100.0)
+
+                nivel = self.simulated_water_level
                 self.last_reading = nivel
+
             logging.debug(f"Nivel de agua simulado: {nivel:.2f}%")
             return nivel
 
@@ -380,7 +389,7 @@ class FlowSensor:
         self.flow_frequency = 0
         self.conversion_factor = self.calibration_params.get('factor', 5.5)
         self.counting_event = threading.Event()
-
+        self.simulated_flow_rate = 0.0  # Añadido para simular el flujo actual
         # Implementación de lock para seguridad de hilos
         self.lock = threading.Lock()
 
@@ -395,9 +404,12 @@ class FlowSensor:
         with self.lock:
             self.flow_frequency += 1
 
-    def leer(self):
+    def leer(self, bomba_activa=False, valvula_riego_abierta=False):
         """
         Lee el caudal actual en litros por minuto.
+        :param bomba_activa: Estado de la bomba (True si está activa)
+        :param valvula_riego_abierta: Estado de la válvula de riego (True si está abierta)
+        :return: Caudal en L/min
         """
         if not self.simulation_mode:
             try:
@@ -425,10 +437,21 @@ class FlowSensor:
                 logging.exception("Error al leer el sensor de flujo:")
                 return None
         else:
-            # Modo simulado con valores realistas
-            flow_rate = random.uniform(1, 60)  # Rango del sensor 1-60 L/min
+            # Modo simulado con lógica mejorada
             with self.lock:
+                if bomba_activa and valvula_riego_abierta:
+                    # Incrementar gradualmente el flujo hasta un máximo
+                    max_flow_rate = 60.0  # Máximo caudal en L/min
+                    increment = 5.0        # Incremento por lectura
+                    self.simulated_flow_rate = min(self.simulated_flow_rate + increment, max_flow_rate)
+                else:
+                    # Decrementar gradualmente el flujo hasta llegar a cero
+                    decrement = 5.0  # Decremento por lectura
+                    self.simulated_flow_rate = max(self.simulated_flow_rate - decrement, 0.0)
+
+                flow_rate = self.simulated_flow_rate
                 self.last_reading = flow_rate
+
             logging.debug(f"Caudal simulado: {flow_rate:.3f} L/min")
             return flow_rate
 
@@ -445,10 +468,19 @@ class FlowSensor:
             if expected_flow is not None:
                 # Definir tolerancia para detectar anomalías
                 tolerance = self.calibration_params.get('tolerance', 0.2)  # 20% de tolerancia
-                if self.last_reading < expected_flow * (1 - tolerance):
-                    logging.error("Posible bloqueo en las tuberías detectado.")
-                    return True
-                elif self.last_reading > expected_flow * (1 + tolerance):
-                    logging.error("Posible fuga en las tuberías detectada.")
-                    return True
+                minimal_flow_threshold = self.calibration_params.get('minimal_flow_threshold', 0.5)  # Umbral mínimo para considerar flujo significativo
+
+                if expected_flow == 0:
+                    # No se espera flujo; si hay flujo significativo, podría ser una fuga
+                    if self.last_reading > minimal_flow_threshold:
+                        logging.error("Posible fuga en las tuberías detectada. Flujo detectado cuando no debería haber.")
+                        return True
+                else:
+                    # Se espera flujo; verificar desviaciones
+                    if self.last_reading < expected_flow * (1 - tolerance):
+                        logging.error("Posible bloqueo en las tuberías detectado.")
+                        return True
+                    elif self.last_reading > expected_flow * (1 + tolerance):
+                        logging.error("Posible fuga en las tuberías detectada.")
+                        return True
         return False

@@ -5,9 +5,11 @@ import pickle
 import logging
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-from sklearn.model_selection import RandomizedSearchCV, train_test_split
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.model_selection import RandomizedSearchCV, train_test_split, KFold, cross_val_score
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.ensemble import IsolationForest
 
@@ -67,7 +69,7 @@ class ModelTraining:
             y = data[['porcentaje_fertilizante', 'cantidad_agua']]
 
             # Convertir la columna 'season' a variables dummy 
-            X = pd.get_dummies(X, columns=['season'], drop_first=True)
+            X = pd.get_dummies(X, columns=['season'], drop_first=False)
 
             # Guardar las características para su uso posterior
             self.features = X.columns.tolist()
@@ -76,14 +78,45 @@ class ModelTraining:
             self.scaler = MinMaxScaler()
             X_scaled = self.scaler.fit_transform(X)
 
+            # Realizar EDA
+            self.realizar_eda(data, X, y)
+
             return X_scaled, y
         except Exception as e:
             logging.error(f"Error al cargar y preparar los datos: {e}")
             return None, None
 
+    def realizar_eda(self, data, X, y):
+        """
+        Realiza un análisis exploratorio de datos sobre las variables objetivo y las características.
+        """
+        # Combinar X y y para análisis conjunto
+        data_eda = pd.concat([X.reset_index(drop=True), y.reset_index(drop=True)], axis=1)
+
+        # Matriz de correlación entre sensores y variables objetivo
+        plt.figure(figsize=(12, 10))
+        corr_matrix = data_eda.corr()
+        sns.heatmap(corr_matrix, annot=True, fmt=".2f", cmap='coolwarm')
+        plt.title('Matriz de Correlación entre Sensores y Variables Objetivo')
+        plt.tight_layout()
+        plt.show()
+
+        # Gráficos de dispersión entre sensores y variables objetivo
+        sensor_columns = ['humidity', 'temperature', 'ph', 'ce', 'water_level', 'flow_rate']
+        target_columns = ['porcentaje_fertilizante', 'cantidad_agua']
+
+        for target in target_columns:
+            plt.figure(figsize=(15, 10))
+            for i, sensor in enumerate(sensor_columns):
+                plt.subplot(2, 3, i+1)
+                sns.scatterplot(data=data_eda, x=sensor, y=target)
+                plt.title(f'{sensor} vs {target}')
+            plt.tight_layout()
+            plt.show()
+
     def entrenar_modelo_local(self):
         """
-        Entrena un modelo de XGBoostRegressor utilizando los datos locales.
+        Entrena un modelo de XGBRegressor utilizando los datos locales.
         """
         X, y = self.cargar_datos()
         if X is None or y is None:
@@ -108,7 +141,7 @@ class ModelTraining:
 
             # Configurar búsqueda aleatoria de hiperparámetros
             random_search = RandomizedSearchCV(
-                XGBRegressor(random_state=42),
+                XGBRegressor(random_state=42, objective='reg:squarederror'),
                 param_distributions=param_dist,
                 n_iter=30,
                 cv=3,
@@ -122,17 +155,60 @@ class ModelTraining:
             self.model = random_search.best_estimator_
             logging.info(f"Mejores hiperparámetros encontrados:\n{random_search.best_params_}")
 
+            # Validación cruzada
+            kf = KFold(n_splits=5, shuffle=True, random_state=42)
+            scores = cross_val_score(
+                self.model,
+                X, y, cv=kf, scoring='neg_mean_squared_error'
+            )
+            logging.info(f"MSE promedio en validación cruzada: {-np.mean(scores):.4f}")
+
             # Realizar predicciones
             y_pred = self.model.predict(X_test)
             mse = mean_squared_error(y_test, y_pred)
+            mae = mean_absolute_error(y_test, y_pred)
             r2 = r2_score(y_test, y_pred)
-            logging.info(f"Evaluación del modelo - MSE: {mse:.4f}, R2: {r2:.4f}")
+            logging.info(f"Evaluación del modelo - MSE: {mse:.4f}, MAE: {mae:.4f}, R2: {r2:.4f}")
+
+            # Visualización de las predicciones vs valores reales
+            self.visualizar_resultados(y_test, y_pred)
 
             # Guardar el modelo entrenado
             self.guardar_modelo()
 
         except Exception as e:
             logging.error(f"Error durante el entrenamiento del modelo: {e}")
+
+    def visualizar_resultados(self, y_test, y_pred):
+        """
+        Visualiza los resultados de las predicciones del modelo.
+        """
+        # Convertir y_pred a DataFrame si es necesario
+        if isinstance(y_pred, np.ndarray):
+            y_pred = pd.DataFrame(y_pred, columns=['porcentaje_fertilizante', 'cantidad_agua'])
+
+        # Para porcentaje de fertilizante
+        plt.figure(figsize=(12, 5))
+
+        plt.subplot(1, 2, 1)
+        plt.scatter(y_test['porcentaje_fertilizante'], y_pred['porcentaje_fertilizante'], color='blue')
+        plt.xlabel('Valor Real')
+        plt.ylabel('Predicción')
+        plt.title('Porcentaje de Fertilizante: Valor Real vs Predicción')
+        plt.plot([y_test['porcentaje_fertilizante'].min(), y_test['porcentaje_fertilizante'].max()],
+                 [y_test['porcentaje_fertilizante'].min(), y_test['porcentaje_fertilizante'].max()], 'r--')
+
+        # Para cantidad de agua
+        plt.subplot(1, 2, 2)
+        plt.scatter(y_test['cantidad_agua'], y_pred['cantidad_agua'], color='green')
+        plt.xlabel('Valor Real')
+        plt.ylabel('Predicción')
+        plt.title('Cantidad de Agua: Valor Real vs Predicción')
+        plt.plot([y_test['cantidad_agua'].min(), y_test['cantidad_agua'].max()],
+                 [y_test['cantidad_agua'].min(), y_test['cantidad_agua'].max()], 'r--')
+
+        plt.tight_layout()
+        plt.show()
 
     def guardar_modelo(self):
         """
@@ -180,7 +256,7 @@ class ModelTraining:
 
             # Convertir 'season' a variables dummy
             if 'season' in entrada.columns:
-                entrada = pd.get_dummies(entrada, columns=['season'], drop_first=True)
+                entrada = pd.get_dummies(entrada, columns=['season'], drop_first=False)
             else:
                 logging.warning("La columna 'season' no está presente en los datos de entrada.")
 
@@ -196,35 +272,13 @@ class ModelTraining:
             # Realizar la predicción
             prediccion = self.model.predict(entrada_scaled)
             resultado = {
-                'porcentaje_fertilizante': max(0, prediccion[0]),
-                'cantidad_agua': max(0, prediccion[1])
+                'porcentaje_fertilizante': max(0, prediccion[0][0]),
+                'cantidad_agua': max(0, prediccion[0][1])
             }
             return resultado
         except Exception as e:
             logging.error(f"Error al realizar predicciones: {e}")
             return None
-
-    def entrenar_modelo_en_nube(self, cloud_sync):
-        """
-        Inicia el proceso de entrenamiento del modelo en la nube.
-        Utiliza el módulo CloudSync para enviar los datos necesarios.
-
-        :param cloud_sync: Instancia de la clase CloudSync para manejar la sincronización.
-        """
-        try:
-            # Enviar datos a la nube para entrenamiento
-            datos_enviados = cloud_sync.enviar_datos()
-            if datos_enviados:
-                # Iniciar el entrenamiento en la nube
-                entrenamiento_iniciado = cloud_sync.entrenar_modelo_en_nube()
-                if entrenamiento_iniciado:
-                    logging.info("Entrenamiento del modelo en la nube iniciado.")
-                else:
-                    logging.warning("No se pudo iniciar el entrenamiento en la nube.")
-            else:
-                logging.warning("No se pudieron enviar los datos de entrenamiento a la nube.")
-        except Exception as e:
-            logging.error(f"Error al enviar datos de entrenamiento a la nube: {e}")
 
 if __name__ == "__main__":
     trainer = ModelTraining()

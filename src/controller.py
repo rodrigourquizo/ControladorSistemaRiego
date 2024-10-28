@@ -43,8 +43,9 @@ class ControladorSistemaRiego:
 
         # Inicializar sensor de flujo
         self.flow_sensor = FlowSensor(gpio_pin=17, calibration_params={
-            'factor': 5.5,     # Factor de calibración específico del sensor
-            'tolerance': 0.2   # Tolerancia aceptable en el caudal
+            'factor': 5.5,                    # Factor de calibración específico del sensor
+            'tolerance': 0.2,                 # Tolerancia aceptable en el caudal (20%)
+            'minimal_flow_threshold': 0.5     # Umbral mínimo para considerar flujo significativo
         })
 
         # Acondicionamiento de señal
@@ -96,6 +97,7 @@ class ControladorSistemaRiego:
         self.irrigation_schedule = []
         self.total_daily_water = 0
         self.remaining_daily_water = 0
+        self.daily_fertilizer_percentage = 0  # Porcentaje de fertilizante diario
 
         # Programar horarios de riego iniciales
         self._programar_riego_diario()
@@ -151,9 +153,8 @@ class ControladorSistemaRiego:
                 logging.info("Interrupción manual del sistema.")
                 break
             except Exception:
-                logging.error("Error en el ciclo principal.")
+                logging.exception("Error en el ciclo principal.")
                 time.sleep(5)
-
 
     def _leer_sensores(self):
         """
@@ -161,6 +162,11 @@ class ControladorSistemaRiego:
         """
         logging.info("Leyendo datos de sensores...")
         try:
+            # Obtener el estado actual de la bomba y la válvula de riego
+            with self.lock:
+                bomba_activa = self.actuator_states.get('bomba', False)
+                valvula_riego_abierta = self.actuator_states.get('valvula_riego', False)
+
             # Lectura del sensor de suelo
             soil_values = self.soil_sensor.leer()
             if soil_values is None:
@@ -170,8 +176,12 @@ class ControladorSistemaRiego:
             temperature = soil_values['temperature']
             ce = soil_values['ce']
             ph = soil_values['ph']
-            water_level = self.level_sensor.leer()
-            flow_rate = self.flow_sensor.leer()
+
+            # Leer el nivel de agua, pasando el estado de la bomba
+            water_level = self.level_sensor.leer(bomba_activa=bomba_activa)
+
+            # Leer el caudal, pasando los estados de los actuadores
+            flow_rate = self.flow_sensor.leer(bomba_activa=bomba_activa, valvula_riego_abierta=valvula_riego_abierta)
 
             # Acondicionamiento de señal
             humidity = self.signal_conditioning.acondicionar_humedad(humidity)
@@ -212,6 +222,7 @@ class ControladorSistemaRiego:
         except Exception:
             logging.exception("Error al leer sensores:")
             raise
+
 
     def _get_current_season(self):
         """
@@ -261,6 +272,7 @@ class ControladorSistemaRiego:
         except Exception:
             logging.exception("Error al verificar anomalías de flujo:")
             raise
+
     def _guardar_datos_csv(self, sensor_values):
         """
         Guarda los datos de sensores en un archivo CSV.
@@ -331,29 +343,22 @@ class ControladorSistemaRiego:
                         logging.warning("No se pueden ejecutar comandos manuales durante una acción crítica.")
                         decision = {}
             else:
-                # Evaluar umbrales críticos
-                umbrales_ok = self._verificar_umbrales(sensor_values)
+                # Utilizar el motor de decisiones (Machine Learning) para tomar decisiones
+                decision = self.decision_engine.evaluar(sensor_values)
 
-                if not umbrales_ok:
-                    logging.warning("Datos fuera de umbrales permitidos. Tomando acciones de emergencia.")
-                    decision = self._acciones_emergencia(sensor_values)
-                else:
-                    # Utilizar el motor de decisiones (Machine Learning) para tomar decisiones
-                    decision = self.decision_engine.evaluar(sensor_values)
+                # Actualizar la cantidad total de agua y fertilizante para el día
+                with self.lock:
+                    self.total_daily_water = decision.get('cantidad_agua', 0)
+                    self.remaining_daily_water = self.total_daily_water
 
-                    # Actualizar la cantidad total de agua y fertilizante para el día
-                    with self.lock:
-                        self.total_daily_water = decision.get('cantidad_agua', 0)
-                        self.remaining_daily_water = self.total_daily_water
+                    # Actualizar el porcentaje de fertilizante
+                    self.daily_fertilizer_percentage = decision.get('porcentaje_fertilizante', 0)
 
-                        # Actualizar el porcentaje de fertilizante
-                        self.daily_fertilizer_percentage = decision.get('porcentaje_fertilizante', 0)
+                # Reprogramar los horarios de riego con la nueva cantidad de agua
+                self._programar_riego_diario()
 
-                    # Reprogramar los horarios de riego con la nueva cantidad de agua
-                    self._programar_riego_diario()
-
-                    # No accionamos actuadores aquí, se hará en los eventos programados
-                    decision = {}  # Vaciar decisión para evitar accionar actuadores ahora
+                # No accionamos actuadores aquí, se hará en los eventos programados
+                decision = {}  # Vaciar decisión para evitar accionar actuadores ahora
 
             # Guardar la decisión en un archivo CSV
             self._guardar_decision_csv(sensor_values, decision)
@@ -471,62 +476,55 @@ class ControladorSistemaRiego:
 
     def _programar_riego_diario(self):
         """
-        Programa los horarios de riego diarios basados en la cantidad de agua estimada por el modelo y la estación actual.
-        Distribuye el riego en varios momentos del día para maximizar la eficiencia.
+        Programa los horarios de riego diarios basados en los requerimientos.
         """
-        # Obtener la estación actual
-        season = self._get_current_season()
-
-        # Definir horarios de riego según la estación
-        if season == 'summer':
-            irrigation_times = ['06:00', '18:00']  # Mañana y tarde
-        elif season == 'winter':
-            irrigation_times = ['12:00']  # Solo al mediodía
-        else:
-            irrigation_times = ['08:00', '16:00']  # Primavera y otoño
-
         # Limpiar programación anterior
         for job in self.irrigation_schedule:
             schedule.cancel_job(job)
         self.irrigation_schedule.clear()
 
-        # Programar nuevos horarios de riego
-        for irrigation_time in irrigation_times:
-            job = schedule.every().day.at(irrigation_time).do(self._iniciar_evento_riego)
-            self.irrigation_schedule.append(job)
+        # Definir horarios y días de riego
+        irrigation_times = ['07:15', '08:15', '09:15']  # Horarios en los que se iniciará el riego
+        irrigation_days = ['Monday', 'Tuesday', 'Wednesday']  # Días de la semana
 
-        logging.info(f"Horarios de riego programados para la estación {season}: {irrigation_times}")
+        for day in irrigation_days:
+            for irrigation_time in irrigation_times:
+                # Ajustar el día específico
+                job = getattr(schedule.every(), day.lower()).at(irrigation_time).do(self._iniciar_evento_riego)
+                self.irrigation_schedule.append(job)
+
+        logging.info(f"Horarios de riego programados: {irrigation_times} en días {irrigation_days}")
 
     def _iniciar_evento_riego(self):
         """
-        Inicia un evento de riego, distribuyendo la cantidad total de agua diaria en los horarios programados.
-        Controla el volumen de agua suministrado mediante el sensor de flujo y detiene el riego al alcanzar la cantidad deseada.
+        Inicia un evento de riego, obteniendo nuevas predicciones antes de regar.
         """
         with self.lock:
             if self.remaining_daily_water <= 0:
                 logging.info("No hay agua restante para distribuir en el riego de hoy.")
                 return
 
-            # Calcular la cantidad de agua para este evento
-            num_events = len(self.irrigation_schedule)
-            water_per_event = self.total_daily_water / num_events
+        # Obtener los valores actuales de los sensores
+        sensor_values = self._leer_sensores()
 
+        # Obtener una nueva decisión del motor de decisiones
+        decision = self.decision_engine.evaluar(sensor_values)
+
+        # Actualizar la cantidad de agua y fertilizante para este evento
+        cantidad_agua = decision.get('cantidad_agua', 0)
+        porcentaje_fertilizante = decision.get('porcentaje_fertilizante', 0)
+
+        with self.lock:
             # Verificar si hay suficiente agua restante
-            if self.remaining_daily_water < water_per_event:
-                water_per_event = self.remaining_daily_water
+            if self.remaining_daily_water < cantidad_agua:
+                cantidad_agua = self.remaining_daily_water
 
             # Actualizar agua restante
-            self.remaining_daily_water -= water_per_event
+            self.remaining_daily_water -= cantidad_agua
 
-        # Crear una decisión para activar el riego con la cantidad calculada
-        decision = {
-            'activar_bomba': True,
-            'abrir_valvula_riego': True,
-            'inyectar_fertilizante': self.daily_fertilizer_percentage > 0,  # Inyectar fertilizante si el porcentaje es mayor a 0
-            'abrir_valvula_suministro': False,
-            'cantidad_agua': water_per_event,
-            'porcentaje_fertilizante': self.daily_fertilizer_percentage
-        }
+        # Actualizar la decisión con la cantidad de agua ajustada
+        decision['cantidad_agua'] = cantidad_agua
+        decision['porcentaje_fertilizante'] = porcentaje_fertilizante
 
         # Iniciar el riego en un hilo separado para no bloquear el ciclo principal
         threading.Thread(target=self._controlar_riego, args=(decision,)).start()
@@ -733,136 +731,6 @@ class ControladorSistemaRiego:
         except Exception:
             logging.exception("Error en sincronización con la nube:")
 
-    def _verificar_umbrales(self, sensor_values):
-        """
-        Verifica si los datos de los sensores están dentro de los umbrales permitidos.
-        Retorna True si todos los valores están dentro de los límites, False de lo contrario.
-        """
-        season = self._get_current_season()
-        logging.info(f"Estación actual: {season}")
-
-        # Definir umbrales según la estación
-        if season == 'summer':
-            UMBRALES = {
-                'humidity': {'min': 20, 'max': 80},
-                'temperature': {'min': 15, 'max': 40},
-                'ph': {'min': 5.5, 'max': 7.5},
-                'ce': {'min': 1.0, 'max': 2.5},
-                'water_level': {'min': 20, 'max': 80},
-                'flow_rate': {'min': 1.0, 'max': 60.0}
-            }
-        elif season == 'autumn':
-            UMBRALES = {
-                'humidity': {'min': 25, 'max': 75},
-                'temperature': {'min': 10, 'max': 30},
-                'ph': {'min': 5.5, 'max': 7.5},
-                'ce': {'min': 1.0, 'max': 2.5},
-                'water_level': {'min': 20, 'max': 80},
-                'flow_rate': {'min': 1.0, 'max': 60.0}
-            }
-        elif season == 'winter':
-            UMBRALES = {
-                'humidity': {'min': 30, 'max': 70},
-                'temperature': {'min': 5, 'max': 25},
-                'ph': {'min': 5.5, 'max': 7.5},
-                'ce': {'min': 1.0, 'max': 2.5},
-                'water_level': {'min': 20, 'max': 80},
-                'flow_rate': {'min': 1.0, 'max': 60.0}
-            }
-        elif season == 'spring':
-            UMBRALES = {
-                'humidity': {'min': 25, 'max': 75},
-                'temperature': {'min': 10, 'max': 30},
-                'ph': {'min': 5.5, 'max': 7.5},
-                'ce': {'min': 1.0, 'max': 2.5},
-                'water_level': {'min': 20, 'max': 80},
-                'flow_rate': {'min': 1.0, 'max': 60.0}
-            }
-        else:
-            # Por defecto
-            UMBRALES = {
-                'humidity': {'min': 20, 'max': 80},
-                'temperature': {'min': 10, 'max': 35},
-                'ph': {'min': 5.5, 'max': 7.5},
-                'ce': {'min': 1.0, 'max': 2.5},
-                'water_level': {'min': 20, 'max': 80},
-                'flow_rate': {'min': 1.0, 'max': 60.0}
-            }
-
-        umbrales_ok = True
-        for sensor, limits in UMBRALES.items():
-            value = sensor_values.get(sensor)
-            if value is None:
-                continue
-            if not (limits['min'] <= value <= limits['max']):
-                logging.warning(f"{sensor} fuera de umbrales: {value} (Límites: {limits})")
-                umbrales_ok = False
-
-        return umbrales_ok
-
-    def _acciones_emergencia(self, sensor_values):
-        """
-        Toma acciones correctivas inmediatas cuando los datos están fuera de los umbrales permitidos.
-        """
-        decision = {}
-
-        try:
-            # Acciones de emergencia para humedad
-            if sensor_values['humidity'] < 20:
-                decision['activar_bomba'] = True
-                decision['abrir_valvula_riego'] = True
-                logging.info("Emergencia: Humedad muy baja. Activando riego.")
-            elif sensor_values['humidity'] > 80:
-                decision['activar_bomba'] = False
-                decision['abrir_valvula_riego'] = False
-                logging.info("Emergencia: Humedad muy alta. Desactivando riego.")
-
-            # Acciones de emergencia para temperatura
-            if sensor_values['temperature'] > 35:
-                # Temperatura muy alta
-                decision['activar_bomba'] = True  # Activamos riego para enfriar el suelo
-                decision['abrir_valvula_riego'] = True
-                logging.info("Emergencia: Temperatura muy alta. Activando riego para enfriar el suelo.")
-            elif sensor_values['temperature'] < 10:
-                # Temperatura muy baja
-                decision['activar_bomba'] = False  # Reducimos riego para evitar enfriar más el suelo
-                decision['abrir_valvula_riego'] = False
-                logging.info("Emergencia: Temperatura muy baja. Desactivando riego para evitar enfriar el suelo.")
-
-            # Acciones de emergencia para pH
-            if sensor_values['ph'] < 5.5:
-                decision['inyectar_fertilizante'] = True
-                decision['porcentaje_fertilizante'] = 5  # Ajustar según necesidad
-                logging.info("Emergencia: pH muy bajo. Inyectando solución alcalina.")
-            elif sensor_values['ph'] > 7.5:
-                decision['inyectar_fertilizante'] = True
-                decision['porcentaje_fertilizante'] = 5  # Ajustar según necesidad
-                logging.info("Emergencia: pH muy alto. Inyectando solución ácida.")
-
-            # Acciones de emergencia para CE
-            if sensor_values['ce'] < 1.0:
-                decision['inyectar_fertilizante'] = True
-                decision['porcentaje_fertilizante'] = 10  # Ajustar según necesidad
-                logging.info("Emergencia: CE muy baja. Inyectando fertilizante.")
-            elif sensor_values['ce'] > 2.5:
-                decision['abrir_valvula_suministro'] = True
-                logging.info("Emergencia: CE muy alta. Diluyendo solución.")
-
-            # Acciones de emergencia para nivel de agua
-            if 'water_level' in sensor_values:
-                if sensor_values['water_level'] < 20:
-                    decision['abrir_valvula_suministro'] = True
-                    logging.info("Emergencia: Nivel de agua bajo. Abriendo suministro alternativo.")
-                elif sensor_values['water_level'] > 80:
-                    decision['abrir_valvula_suministro'] = False
-                    logging.info("Nivel de agua adecuado. Cerrando suministro alternativo.")
-
-            return decision
-
-        except Exception:
-            logging.exception("Error en acciones de emergencia:")
-            raise
-
     def _guardar_decision_csv(self, sensor_values, decision):
         """
         Guarda las decisiones tomadas junto con los datos de sensores en un archivo CSV.
@@ -913,4 +781,3 @@ class ControladorSistemaRiego:
         except Exception:
             logging.exception("Error al guardar decisión en CSV:")
             raise
-
