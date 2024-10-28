@@ -3,8 +3,8 @@
 import time
 import logging
 import sys
-from unittest.mock import MagicMock
-# Simular RPi.GPIO solo si no estamos en un Raspberry Pi
+
+# Simular RPi.GPIO solo si no estamos en una Raspberry Pi
 if sys.platform == "win32":
     from unittest.mock import MagicMock
     GPIO = MagicMock()
@@ -14,7 +14,7 @@ else:
         import RPi.GPIO as GPIO
     except ImportError:
         logging.warning("Librerías de RPi.GPIO no disponibles en este entorno.")
-        GPIO = MagicMock()
+        GPIO = None
 
 # Configuración del logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -25,23 +25,29 @@ class ActuatorBase:
     Clase base para los actuadores. Proporciona métodos para inicialización,
     activación, desactivación y manejo de estado.
     """
-    def __init__(self, gpio_pin, nombre_actuador="Actuador"):
+    def __init__(self, gpio_pin, nombre_actuador="Actuador", active_low=False):
         """
         Inicializa el actuador en el pin GPIO especificado.
 
         :param gpio_pin: Número del pin GPIO al que está conectado el actuador.
         :param nombre_actuador: Nombre descriptivo del actuador.
+        :param active_low: Indica si el actuador se activa con una señal baja (GPIO.LOW).
         """
         self.gpio_pin = gpio_pin
         self.nombre_actuador = nombre_actuador
         self.estado = False  # Estado inicial: desactivado
+        self.active_low = active_low  # Control de lógica inversa
 
-        self.simulation_mode = isinstance(GPIO, MagicMock)
+        self.simulation_mode = sys.platform == "win32" or GPIO is None
 
         if not self.simulation_mode:
             GPIO.setmode(GPIO.BCM)  # Usar numeración BCM
             GPIO.setup(self.gpio_pin, GPIO.OUT)
-            GPIO.output(self.gpio_pin, GPIO.LOW)  # Estado inicial apagado
+            # Establecer estado inicial
+            if self.active_low:
+                GPIO.output(self.gpio_pin, GPIO.HIGH)  # Estado inicial apagado
+            else:
+                GPIO.output(self.gpio_pin, GPIO.LOW)  # Estado inicial apagado
             logging.info(f"{self.nombre_actuador} inicializado en pin GPIO {self.gpio_pin}.")
         else:
             logging.info(f"{self.nombre_actuador} inicializado en modo simulado.")
@@ -53,7 +59,10 @@ class ActuatorBase:
         if not self.estado:
             self.estado = True
             if not self.simulation_mode:
-                GPIO.output(self.gpio_pin, GPIO.HIGH)
+                if self.active_low:
+                    GPIO.output(self.gpio_pin, GPIO.LOW)
+                else:
+                    GPIO.output(self.gpio_pin, GPIO.HIGH)
             logging.info(f"{self.nombre_actuador} activado.")
         else:
             logging.debug(f"{self.nombre_actuador} ya estaba activado.")
@@ -65,7 +74,10 @@ class ActuatorBase:
         if self.estado:
             self.estado = False
             if not self.simulation_mode:
-                GPIO.output(self.gpio_pin, GPIO.LOW)
+                if self.active_low:
+                    GPIO.output(self.gpio_pin, GPIO.HIGH)
+                else:
+                    GPIO.output(self.gpio_pin, GPIO.LOW)
             logging.info(f"{self.nombre_actuador} desactivado.")
         else:
             logging.debug(f"{self.nombre_actuador} ya estaba desactivado.")
@@ -94,13 +106,13 @@ class PumpControl(ActuatorBase):
     Control de la bomba hidráulica.
     """
     def __init__(self, gpio_pin):
-        super().__init__(gpio_pin, nombre_actuador="Bomba Hidráulica")
+        # Suponiendo que la bomba se activa en alto, active_low=False
+        super().__init__(gpio_pin, nombre_actuador="Bomba Hidráulica", active_low=False)
 
 
 class ValveControl:
     """
-    Control de las electroválvulas. Maneja múltiples válvulas, como la de riego
-    y suministro alternativo.
+    Control de las electroválvulas. Maneja múltiples válvulas.
     """
     def __init__(self, valvulas_config):
         """
@@ -109,13 +121,15 @@ class ValveControl:
         :param valvulas_config: Diccionario con la configuración de las válvulas.
                                 Ejemplo:
                                 {
-                                    'riego': gpio_pin_riego,
-                                    'suministro_alternativo': gpio_pin_suministro
+                                    'valvula_riego': gpio_pin_riego,
+                                    'valvula_suministro': gpio_pin_suministro,
+                                    'valvula_fertilizante': gpio_pin_fertilizante
                                 }
         """
         self.valvulas = {}
         for nombre, pin in valvulas_config.items():
-            self.valvulas[nombre] = ActuatorBase(pin, nombre_actuador=f"Válvula {nombre.capitalize()}")
+            # Suponiendo que las válvulas se activan en bajo (común en módulos de relés)
+            self.valvulas[nombre] = ActuatorBase(pin, nombre_actuador=f"Válvula {nombre}", active_low=True)
         logging.info("Control de Electroválvulas inicializado.")
 
     def abrir_valvula(self, nombre_valvula):
@@ -163,11 +177,3 @@ class ValveControl:
         for valvula in self.valvulas.values():
             valvula.limpiar()
         logging.info("Configuración de electroválvulas limpiada.")
-
-
-class FertilizerInjector(ActuatorBase):
-    """
-    Control del inyector de fertilizante (válvula ON/OFF).
-    """
-    def __init__(self, gpio_pin):
-        super().__init__(gpio_pin, nombre_actuador="Inyector de Fertilizante")

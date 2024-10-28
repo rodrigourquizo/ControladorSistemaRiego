@@ -66,7 +66,7 @@ class SignalConditioning:
 
     def _filtrar_valor(self, valor, tipo):
         """
-        Aplica un filtro promedio móvil sencillo al valor para reducir el ruido.
+        Aplica un filtro de mediana al valor para reducir el ruido.
 
         :param valor: Valor actual del sensor.
         :param tipo: Tipo de sensor ('humedad', 'ph', 'ce', 'nivel', 'temperatura').
@@ -81,7 +81,7 @@ class SignalConditioning:
             historial.pop(0)
         # Actualizar el historial
         self.historicos[tipo] = historial
-        # Calcular el promedio de los valores en el historial
-        valor_filtrado = np.mean(historial)
+        # Aplicar filtro de mediana
+        valor_filtrado = np.median(historial)
         logging.debug(f"Valor filtrado para {tipo}: {valor_filtrado}")
         return valor_filtrado
